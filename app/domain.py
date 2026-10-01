@@ -38,6 +38,58 @@ def cert_failure_window(cert: dict[str, Any], revision: int):
     return None, None
 
 
+def chain_link(cert: dict[str, Any], revision: int) -> dict[str, Any]:
+    """失效链 / 证书链中单个环节的序列化视图。"""
+    return {
+        "certificate_id": cert["id"],
+        "instrument_id": cert["instrument_id"],
+        "is_root": cert["is_root"],
+        "parent_id": cert["parent_id"],
+        "status": cert_status(cert, revision),
+    }
+
+
+def causal_failure_chain(
+    chain: list[dict[str, Any]], revision: int, measured_at
+) -> tuple[list[dict[str, Any]], int | None]:
+    """按每级子证书的校准时刻追溯测量的失效因果链。
+
+    ``chain`` 为 :func:`load_cert_chain` 得到的 [绑定证书, 直接上级, ..., 根证书]，
+    ``measured_at`` 为测量时刻。返回 ``(失效因果链环节, 根因证书 id)``；测量在该
+    修订下仍有效（例如绑定证书虽已撤销但测量早于撤销时刻）时返回 ``([], None)``。
+
+    追溯规则（逐级向上，每一级都用**依赖该证书的时刻**比对其失效区间
+    ``[from, to)``）：
+
+    - 链首（绑定证书）的依赖时刻为**测量时刻**；其后每级的依赖时刻为后一级
+      **子证书的校准时刻**；
+    - ``invalid``（整证判废）：失效区间即整条有效期，必然覆盖依赖时刻，
+      构成本级环节并继续上行；
+    - ``revoked``（撤销）：仅当失效区间 ``[revoked_at, valid_to)`` 覆盖依赖时刻
+      时才构成因果环节。链首未覆盖意味着测量早于绑定证书撤销时刻（测量仍有效）；
+      上级未覆盖意味着**上级晚撤销**（撤销时刻晚于子证书校准，子证书校准时上级
+      仍然有效），该级及其以上与本次失效无关；两种情况都立即终止追溯；
+    - ``valid``：追溯终止。
+
+    最后一个入环证书即根因证书。
+    """
+    links: list[dict[str, Any]] = []
+    root_cause_id: int | None = None
+
+    for i, cert in enumerate(chain):
+        status = cert_status(cert, revision)
+        if status == "valid":
+            break
+        if status == "revoked":
+            dependent_at = measured_at if i == 0 else chain[i - 1]["calibrated_at"]
+            if not (cert["revoked_at"] <= dependent_at < cert["valid_to"]):
+                break
+        links.append(chain_link(cert, revision))
+        root_cause_id = cert["id"]
+
+    return links, root_cause_id
+
+
 def serialize_cert(cert: dict[str, Any], revision: int) -> dict[str, Any]:
     fail_from, fail_to = cert_failure_window(cert, revision)
     return {
@@ -106,14 +158,5 @@ def serialize_measurement(
     if cert is not None:
         result["certificate_status"] = cert_status(cert, revision)
     if chain is not None:
-        result["certificate_chain"] = [
-            {
-                "certificate_id": c["id"],
-                "instrument_id": c["instrument_id"],
-                "is_root": c["is_root"],
-                "parent_id": c["parent_id"],
-                "status": cert_status(c, revision),
-            }
-            for c in chain
-        ]
+        result["certificate_chain"] = [chain_link(c, revision) for c in chain]
     return result

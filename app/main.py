@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field, field_validator
 
 from . import db, domain
 from .domain import (
+    causal_failure_chain,
+    chain_link,
     iso,
     load_cert_chain,
     serialize_cert,
@@ -304,16 +306,7 @@ def create_certificate(body: CertificateIn, conn=Depends(db.get_conn)):
     return {
         "revision": new_rev,
         "certificate": serialize_cert(row, new_rev),
-        "certificate_chain": [
-            {
-                "certificate_id": c["id"],
-                "instrument_id": c["instrument_id"],
-                "is_root": c["is_root"],
-                "parent_id": c["parent_id"],
-                "status": domain.cert_status(c, new_rev),
-            }
-            for c in chain
-        ],
+        "certificate_chain": [chain_link(c, new_rev) for c in chain],
     }
 
 
@@ -548,25 +541,17 @@ def revoke_certificate(cert_id: int, body: RevokeIn, conn=Depends(db.get_conn)):
             "invalidated_revision": r["invalidated_revision"],
         }
         chain_rows = load_cert_chain(conn, r["certificate_id"], new_rev)
-        chain = [
-            {
-                "certificate_id": c["id"],
-                "instrument_id": c["instrument_id"],
-                "is_root": c["is_root"],
-                "parent_id": c["parent_id"],
-                "status": domain.cert_status(c, new_rev),
-            }
-            for c in chain_rows
-        ]
-        # 失效证书链：从绑定证书起，向上收集当前已失效（撤销/判废）的环节
-        failure_chain = [link for link in chain if link["status"] in ("revoked", "invalid")]
+        # 失效因果链：按每级子证书的校准时刻逐级追溯，区分上级晚撤销与自身撤销
+        failure_chain, root_cause_id = causal_failure_chain(
+            chain_rows, new_rev, r["measured_at"]
+        )
         invalid_measurements.append(
             {
                 "measurement": serialize_measurement(
                     meas, new_rev, chain_rows[0], chain_rows
                 ),
                 "failure_chain": failure_chain,
-                "root_cause_certificate_id": failure_chain[-1]["certificate_id"],
+                "root_cause_certificate_id": root_cause_id,
             }
         )
 
@@ -640,16 +625,7 @@ def get_certificate(
     return {
         "revision": rev,
         "certificate": serialize_cert(cert, rev),
-        "certificate_chain": [
-            {
-                "certificate_id": c["id"],
-                "instrument_id": c["instrument_id"],
-                "is_root": c["is_root"],
-                "parent_id": c["parent_id"],
-                "status": domain.cert_status(c, rev),
-            }
-            for c in chain
-        ],
+        "certificate_chain": [chain_link(c, rev) for c in chain],
     }
 
 
@@ -711,8 +687,14 @@ def get_measurement(
         )
     chain = load_cert_chain(conn, meas["certificate_id"], rev)
     cert = chain[0]
+    # 按目标修订追溯失效因果链（有效测量返回空链 / 无根因）
+    failure_chain, root_cause_id = causal_failure_chain(
+        chain, rev, meas["measured_at"]
+    )
     conn.commit()
     return {
         "revision": rev,
         "measurement": serialize_measurement(meas, rev, cert, chain),
+        "failure_chain": failure_chain,
+        "root_cause_certificate_id": root_cause_id,
     }

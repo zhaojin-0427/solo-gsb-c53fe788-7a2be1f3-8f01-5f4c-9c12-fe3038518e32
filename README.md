@@ -9,8 +9,9 @@
 - 登记测量（数值 + 发生时刻）时绑定覆盖该时刻的有效证书；**缺证书或已失效一律拒绝**
 - 证书可从其有效期内指定时刻起**撤销**：既有测量随之重判；子证书仅当其**校准时刻落入上级失效区间**时递归整证失效
 - 撤销响应列出本次转为无效的测量及其**失效证书链**（直到根因证书）
+- 失效链**按每级子证书的校准时刻逐级追溯因果**：仅当上级失效区间覆盖子证书校准时刻（或覆盖测量时刻）才计入；**上级晚撤销**（撤销时刻晚于子证书校准，子证书校准时上级仍有效）不会被追溯为根因
 - 所有写请求携带 `expected_revision`，在单事务内原子推进**全局修订号**；过期返回 **409**
-- 查询接口支持 `?revision=N`，**任意历史修订下的测量结论均保留**
+- 查询接口支持 `?revision=N`，**任意历史修订下的测量结论、失效链与根因均保留**
 
 ## 目录结构
 
@@ -23,7 +24,7 @@
 ├── scripts/
 │   ├── demo.py            # 基础流程演示（生成 README 样例）
 │   └── demo_recursive.py  # 递归失效演示
-├── tests_e2e.py       # 端到端业务规则测试（87 项断言）
+├── tests_e2e.py       # 端到端业务规则测试（105 项断言）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -31,11 +32,13 @@
 
 ## 一键启动（Docker Compose）
 
+前置条件：已安装 Docker 与 Docker Compose 插件（`docker compose version` 可正常输出版本）。
+
 ```bash
 docker compose up --build
 ```
 
-首次启动会自动建表（含 `btree_gist` 扩展与排他约束）。
+首次启动会自动建表（含 `btree_gist` 扩展与排他约束）。`db` 通过健康检查后 `api` 才启动，无需手动初始化；停止后再次 `docker compose up` 会复用命名卷 `pgdata` 中的数据。
 
 访问地址：
 
@@ -44,10 +47,48 @@ docker compose up --build
 | API 根路径 | http://localhost:8000/ |
 | 健康检查 | http://localhost:8000/health |
 | 当前全局修订号 | http://localhost:8000/api/revision |
-| Swagger 交互文档 | http://localhost:8000/docs |
+| 撤销接口 | `POST http://localhost:8000/api/certificates/{证书id}/revoke` |
+| Swagger 交互文档（可直接在线点选调用撤销） | http://localhost:8000/docs |
 | OpenAPI Schema | http://localhost:8000/openapi.json |
 
 停止并保留数据：`docker compose stop`；清空数据重来：`docker compose down -v`。
+
+### 启动后调用撤销接口
+
+服务启动后，先登记根证书与子证书（写请求需携带当前修订号，可用 `GET /api/revision` 查询）：
+
+```bash
+# 登记根证书（修订 0 -> 1）
+curl -s -X POST http://localhost:8000/api/certificates \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":0,"instrument_id":"STD","calibrated_at":"2026-01-01T00:00:00Z","valid_from":"2026-01-01T00:00:00Z","valid_to":"2027-01-01T00:00:00Z","error_value":0.0,"tolerance":0.5,"is_root":true}'
+
+# 登记校准于 2026-02-01 的子证书 C（修订 1 -> 2）
+curl -s -X POST http://localhost:8000/api/certificates \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":1,"instrument_id":"DMM","calibrated_at":"2026-02-01T00:00:00Z","valid_from":"2026-02-01T00:00:00Z","valid_to":"2026-08-01T00:00:00Z","error_value":0.0,"tolerance":0.2,"parent_id":1}'
+```
+
+调用撤销接口（请求体为 `expected_revision` + `revoked_at`，撤销时刻须落在证书半开有效期内）：
+
+```bash
+# 在 C 校准时刻（02-01）之后撤销根证书 R —— 属“上级晚撤销”，C 不会被递归判废
+curl -s -X POST http://localhost:8000/api/certificates/1/revoke \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":2,"revoked_at":"2026-02-15T00:00:00Z"}'
+
+# 再撤销 C；此时落入 C 撤销区间的测量失效，其 failure_chain 只含 C、
+# root_cause_certificate_id 为 C（R 的晚撤销不会被追溯为根因）
+curl -s -X POST http://localhost:8000/api/certificates/2/revoke \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":3,"revoked_at":"2026-05-01T00:00:00Z"}'
+```
+
+> 也可打开 http://localhost:8000/docs ，在 **POST `/api/certificates/{cert_id}/revoke`** 一栏点 “Try it out” 直接发起撤销。撤销响应中：
+>
+> - `invalidated_certificates`：校准时刻落入上级失效区间、被整证递归判废的证书；
+> - `invalidated_measurements[].failure_chain`：按每级校准时刻追溯出的失效因果链；
+> - `invalidated_measurements[].root_cause_certificate_id`：根因证书（链中最后一个环节）。
 
 ### 本地非 Docker 运行（可选）
 
@@ -69,7 +110,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/certificates/{id}` | 证书详情 + 证书链 |
 | POST | `/api/measurements` | 登记测量（写；不传 `certificate_id` 则自动绑定） |
 | GET | `/api/measurements` | 测量结论列表，可按 `instrument_id`、`revision` 过滤 |
-| GET | `/api/measurements/{id}` | 单条测量在指定修订下的结论 |
+| GET | `/api/measurements/{id}` | 单条测量在指定修订下的结论（含 `failure_chain`、`root_cause_certificate_id`） |
 
 写请求的时间字段均为 ISO 8601（建议带 `Z` 时区；不带时区按 UTC 处理）。
 
@@ -78,6 +119,25 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `valid`：当前有效
 - `revoked`：已撤销，失效区间为 `[revoked_at, valid_to)`；撤销时刻之前产生的结论仍有效
 - `invalid`：校准时刻落入上级失效区间而被**递归整证判废**，整条有效期均不可信
+
+### 失效链因果追溯
+
+撤销响应与测量详情中的 `failure_chain` 不是“链上所有当前失效证书”的简单拼接，而是
+**按每级子证书的校准时刻逐级追溯因果**得到的链：
+
+1. 从测量绑定的证书开始，用**测量时刻**比对该证书的失效区间；
+2. 每上行一级，改用**下一级子证书的校准时刻**比对当前证书的失效区间
+   `[from, to)`；
+3. `invalid`（整证判废）的失效区间即整条有效期，必然覆盖子证书校准时刻，入环并继续上行；
+4. `revoked`（撤销）仅当其失效区间覆盖该依赖时刻时入环；否则停止追溯——
+   - 链首不覆盖：测量早于绑定证书的撤销时刻，测量本身仍有效，`failure_chain` 为空；
+   - 上级不覆盖：即**上级晚撤销**（撤销时刻晚于子证书校准，子证书校准时上级仍
+     有效），子证书的失效与该上级无关，上级不得列为根因；
+5. 追溯到 `valid` 证书时终止。链中最后一个环节即 `root_cause_certificate_id`。
+
+因此：**R 在 C 校准时刻之后被撤销、随后 C 自身撤销**时，落入 C 撤销区间的测量其
+失效链仅为 `[C]`、根因为 C——尽管当前状态下 R 也处于 `revoked`。该追溯按
+`?revision=N` 的目标修订计算，历史修订下的失效链与根因同样保留。
 
 ## 实际请求 / 响应样例
 
@@ -384,9 +444,110 @@ POST /api/certificates/2/revoke
 
 要点：测量 1 发生在撤销时刻之前，**仍然有效**（`invalidated_revision` 保持 `null`）；测量 2 落入失效区间 `[revoked_at, valid_to)`，被重判为无效并出现在 `invalidated_measurements` 中，同时给出失效链与根因证书。本例无子证书的校准时刻落入失效区间，因此 `invalidated_certificates` 为空。
 
-### 7. 按历史修订查询（历史结论保留）
+### 7. 上级晚撤销：根因是自身撤销，不把上级误列为根因
 
-撤销发生在修订 5。按修订 4 查询测量 2，仍返回撤销前的结论 `valid=true`，且链上各证书显示为当时的 `valid` 状态：
+按以下时序操作：根证书 R 校准于 `2026-01-01`；子证书 C 校准于 `2026-02-01`（R 仍有效）；
+一条测量在 `2026-06-10` 绑定 C。随后**先**在 C 校准时刻之后（`2026-02-15`）撤销 R，
+**再**撤销 C（`2026-05-01`）。
+
+撤销 R 时，C 的校准时刻（02-01）**早于** R 的失效起点（02-15），属于**上级晚撤销**：
+C 不递归判废、也没有测量失效（`invalidated_measurement_count=0`）。
+
+```
+POST /api/certificates/2/revoke
+```
+```json
+{
+  "expected_revision": 4,
+  "revoked_at": "2026-05-01T00:00:00Z"
+}
+```
+```json
+{
+  "revision": 5,
+  "revoked_certificate": {
+    "id": 2,
+    "instrument_id": "DMM-L",
+    "serial": null,
+    "calibrated_at": "2026-02-01T00:00:00Z",
+    "valid_from": "2026-02-01T00:00:00Z",
+    "valid_to": "2026-08-01T00:00:00Z",
+    "error_value": 0.0,
+    "tolerance": 0.2,
+    "parent_id": 1,
+    "is_root": false,
+    "revoked_at": "2026-05-01T00:00:00Z",
+    "revoked_revision": 5,
+    "invalidated_revision": null,
+    "created_revision": 2,
+    "status": "revoked",
+    "failure_window": {
+      "from": "2026-05-01T00:00:00Z",
+      "to": "2026-08-01T00:00:00Z"
+    }
+  },
+  "invalidated_certificates": [],
+  "invalidated_measurements": [
+    {
+      "measurement": {
+        "id": 1,
+        "instrument_id": "DMM-L",
+        "value": 5.018,
+        "measured_at": "2026-06-10T08:00:00Z",
+        "certificate_id": 2,
+        "created_revision": 3,
+        "invalidated_revision": 5,
+        "revision": 5,
+        "valid": false,
+        "certificate_status": "revoked",
+        "certificate_chain": [
+          {
+            "certificate_id": 2,
+            "instrument_id": "DMM-L",
+            "is_root": false,
+            "parent_id": 1,
+            "status": "revoked"
+          },
+          {
+            "certificate_id": 1,
+            "instrument_id": "STD-L",
+            "is_root": true,
+            "parent_id": null,
+            "status": "revoked"
+          }
+        ]
+      },
+      "failure_chain": [
+        {
+          "certificate_id": 2,
+          "instrument_id": "DMM-L",
+          "is_root": false,
+          "parent_id": 1,
+          "status": "revoked"
+        }
+      ],
+      "root_cause_certificate_id": 2
+    }
+  ],
+  "invalidated_measurement_count": 1
+}
+```
+
+要点：虽然此刻证书链上 C、R 的**当前状态**都是 `revoked`（见响应中
+`certificate_chain`），但追溯按每级校准时刻进行——R 的失效区间 `[02-15, ...)`
+不覆盖 C 的校准时刻 02-01，故 R **不进入 `failure_chain`**，该测量首次因
+**C 自身撤销**而失效，根因为 C。测量详情接口同样如此，且历史修订不回归：
+
+```bash
+# 当前修订：失效链 [C]，根因 C（certificate_chain 中 R 仍显示 revoked，但不构成因果）
+GET /api/measurements/1
+# rev=4（R 已撤销、C 未撤销）：测量仍有效，failure_chain=[]、root_cause_certificate_id=null
+GET /api/measurements/1?revision=4
+```
+
+### 8. 按历史修订查询（历史结论保留）
+
+撤销发生在修订 5。按修订 4 查询测量 2，仍返回撤销前的结论 `valid=true`，且链上各证书显示为当时的 `valid` 状态；失效链为空、无根因：
 
 ```
 GET /api/measurements/2?revision=4
@@ -421,13 +582,15 @@ GET /api/measurements/2?revision=4
         "status": "valid"
       }
     ]
-  }
+  },
+  "failure_chain": [],
+  "root_cause_certificate_id": null
 }
 ```
 
-不带 `revision` 时返回当前修订下的结论（测量 2 为 `valid=false`）。查询尚不存在的未来修订返回 `404 revision_not_found`。
+不带 `revision` 时返回当前修订下的结论（测量 2 为 `valid=false`，`failure_chain=[证书2]`、`root_cause_certificate_id=2`）。查询尚不存在的未来修订返回 `404 revision_not_found`。
 
-### 8. 证书失效后登记测量 → 422 拒绝
+### 9. 证书失效后登记测量 → 422 拒绝
 
 ```
 POST /api/measurements
@@ -456,7 +619,7 @@ HTTP 422
 
 若不存在任何覆盖该时刻的证书，则返回 `error=no_certificate`；若覆盖证书已被递归判废，则返回 `error=certificate_invalid`。
 
-### 9. 递归整证失效（撤销根证书）
+### 10. 递归整证失效（撤销根证书）
 
 由 `scripts/demo_recursive.py` 真实调用产生：三级链 `STD-R(根) → DMM-R → DUT-R`，各级校准时刻分别为 2026-01-01 / 02-01 / 03-01，并有一条发生于 2026-04-01 的测量绑定在孙证书上。自 **2026-01-15** 起撤销根证书：
 
@@ -603,7 +766,7 @@ POST /api/certificates/1/revoke
 
 传播规则：子证书 2 的校准时刻 02-01 落入根证书失效区间 `[01-15, 明年01-01)`，故**整证失效**，其失效区间变为整条有效期 `[2026-02-01, 2026-12-01)`；孙证书 3 的校准时刻 03-01 又落入该区间，递归判废。若子证书校准时刻早于上级失效起点（如根 02-15 才撤销、子证书 02-01 校准），则子证书不判废、其子树也不传播。
 
-### 10. 其他常见错误（均为 HTTP 422，请求体结构问题为 FastAPI 标准 422）
+### 11. 其他常见错误（均为 HTTP 422，请求体结构问题为 FastAPI 标准 422）
 
 | 场景 | `detail.error` |
 | --- | --- |
@@ -626,7 +789,7 @@ POST /api/certificates/1/revoke
 
 ## 运行测试
 
-端到端测试覆盖上述全部规则（半开区间边界、容差、重叠排他、自动/显式绑定、撤销截止边界、递归传播、混合传播、409、历史修订），共 87 项断言：
+端到端测试覆盖上述全部规则（半开区间边界、容差、重叠排他、自动/显式绑定、撤销截止边界、递归传播、混合传播、按校准时刻追溯失效链 / 上级晚撤销、409、历史修订下的失效链），共 105 项断言：
 
 ```bash
 # 需要一个可连接的 PostgreSQL，并设置 DATABASE_URL

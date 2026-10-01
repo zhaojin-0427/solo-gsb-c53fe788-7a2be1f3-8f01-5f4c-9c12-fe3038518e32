@@ -119,7 +119,7 @@ r = client.get(f"/api/measurements/{m4['id']}").json()
 check("m4 撤销时刻前仍有效", r["measurement"]["valid"] is True
       and r["measurement"]["certificate_status"] == "revoked")
 
-# 撤销 C 于 2026-05-01
+# 撤销 C 于 2026-05-01（R 已于 02-15 撤销，但 C 校准于 02-01，早于 R 失效起点）
 r = client.post(f"/api/certificates/{c_id}/revoke", json={
     "expected_revision": 8,
     "revoked_at": "2026-05-01T00:00:00Z",
@@ -130,11 +130,27 @@ inv = data["invalidated_measurements"]
 check("仅 m3(07-15) 本次失效，数量=1", len(inv) == 1, str(len(inv)))
 check("失效的是 m3", bool(inv) and inv[0]["measurement"]["id"] == m3["id"])
 fc = inv[0]["failure_chain"]
-check("m3 失效链为 C->R", [x["certificate_id"] for x in fc] == [c_id, root_id],
+# R 属上级晚撤销（撤销时刻 02-15 晚于 C 校准时刻 02-01），m3 首次因 C 自身撤销失效：
+# 失效链不得把 R 列入，根因为 C 而非 R
+check("m3 失效链仅为 C（不列入晚撤销的 R）",
+      [x["certificate_id"] for x in fc] == [c_id],
       str([x["certificate_id"] for x in fc]))
-check("根因证书为 R", inv[0]["root_cause_certificate_id"] == root_id)
-check("失效链状态 C=revoked,R=revoked",
-      [x["status"] for x in fc] == ["revoked", "revoked"])
+check("根因证书为 C（非 R）", inv[0]["root_cause_certificate_id"] == c_id)
+check("失效链状态 C=revoked", [x["status"] for x in fc] == ["revoked"])
+
+# 测量详情接口同样按因果追溯给出失效链（当前修订与历史修订）
+r = client.get(f"/api/measurements/{m3['id']}").json()
+check("当前修订 m3 失效链仅为 C、根因 C",
+      [x["certificate_id"] for x in r["failure_chain"]] == [c_id]
+      and r["root_cause_certificate_id"] == c_id, str(r))
+r = client.get(f"/api/measurements/{m3['id']}?revision=8").json()
+check("rev=8（R 已撤销、C 未撤销）m3 有效且无失效链、无根因",
+      r["measurement"]["valid"] is True
+      and r["failure_chain"] == [] and r["root_cause_certificate_id"] is None, str(r))
+# m4 绑定 R 自身：R 撤销前的测量仍有效，不产生失效链
+r = client.get(f"/api/measurements/{m4['id']}").json()
+check("m4 有效且无失效链",
+      r["measurement"]["valid"] is True and r["failure_chain"] == [], str(r))
 
 # G 校准 03-01 早于 C 失效起点 05-01 -> G 不判废；m1/m2 仍有效
 r = client.get(f"/api/measurements/{m1['id']}").json()
@@ -414,6 +430,15 @@ check("C3、G3 判废", inv_certs == [C3, G3], str(inv_certs))
 g_item = [x for x in data["invalidated_measurements"] if x["measurement"]["id"] == m_g][0]
 check("m_g 失效链 G3->C3->R3",
       [x["certificate_id"] for x in g_item["failure_chain"]] == [G3, C3, R3])
+# m_pre 发生在 C3 自身撤销(05-01)之前，是 C3 被 R3 递归判废后才首次失效：
+# 失效链应为 [C3(invalid), R3(revoked)]，根因 R3
+pre_item = [x for x in data["invalidated_measurements"]
+            if x["measurement"]["id"] == m_pre][0]
+check("m_pre 失效链 C3(invalid)->R3(revoked) 根因 R3",
+      [x["certificate_id"] for x in pre_item["failure_chain"]] == [C3, R3]
+      and [x["status"] for x in pre_item["failure_chain"]] == ["invalid", "revoked"]
+      and pre_item["root_cause_certificate_id"] == R3,
+      str(pre_item))
 
 # 历史结论：rev=6（两次撤销前）m_pre、m_post 均有效；
 # rev=7（撤销 C3 后）m_post 无效、m_pre 仍有效；rev=8 时全部无效
@@ -428,6 +453,83 @@ check("历史 rev=7 m_pre 仍有效", r["measurement"]["valid"] is True)
 for mid in (m_pre, m_post, m_g):
     r = client.get(f"/api/measurements/{mid}").json()
     check(f"当前 rev 测量 {mid} 无效", r["measurement"]["valid"] is False)
+
+print()
+print("== 场景 7：三级链逐级“上级晚撤销”，根因均为自身撤销 ==")
+reset_db()
+
+# R 根 01-01 校准，有效期至 2027
+r = mkcert(0, "STD7", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
+           "2027-01-01T00:00:00Z", 0.0, 0.5, root=True)
+R7 = r.json()["certificate"]["id"]
+# C 02-01 校准（R 有效时）
+r = mkcert(1, "A7", "2026-02-01T00:00:00Z", "2026-02-01T00:00:00Z",
+           "2026-12-01T00:00:00Z", 0.0, 0.5, parent=R7)
+C7 = r.json()["certificate"]["id"]
+# G 03-01 校准（C 有效时）
+r = mkcert(2, "B7", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z",
+           "2026-11-01T00:00:00Z", 0.0, 0.5, parent=C7)
+G7 = r.json()["certificate"]["id"]
+
+# 测量：G 上 04-01、C 上 05-01、R 上 06-01
+r = post_meas(3, "2026-04-01T00:00:00Z", inst="B7")
+m7_g = r.json()["measurement"]["id"]
+r = post_meas(4, "2026-05-01T00:00:00Z", inst="A7")
+m7_c = r.json()["measurement"]["id"]
+r = post_meas(5, "2026-06-01T00:00:00Z", inst="STD7")
+m7_r = r.json()["measurement"]["id"]
+
+# R 自 05-15 撤销：晚于 C 校准(02-01)，C/G 均不递归判废；m7_r(06-01) 失效
+r = client.post(f"/api/certificates/{R7}/revoke", json={
+    "expected_revision": 6, "revoked_at": "2026-05-15T00:00:00Z"})
+check("R 晚撤销成功", r.status_code == 200, r.text)
+data = r.json()
+check("R 撤销仅失效 m7_r",
+      [x["measurement"]["id"] for x in data["invalidated_measurements"]] == [m7_r], r.text)
+item = data["invalidated_measurements"][0]
+check("m7_r 失效链 [R] 根因 R",
+      [x["certificate_id"] for x in item["failure_chain"]] == [R7]
+      and item["root_cause_certificate_id"] == R7, str(item))
+
+# C 自 04-15 撤销：晚于 G 校准(03-01)，G 不判废；m7_c(05-01) 失效，m7_g(04-01) 仍有效
+r = client.post(f"/api/certificates/{C7}/revoke", json={
+    "expected_revision": 7, "revoked_at": "2026-04-15T00:00:00Z"})
+check("C 晚撤销成功", r.status_code == 200, r.text)
+data = r.json()
+check("C 撤销仅失效 m7_c（G 不传播、m7_g 不在区间）",
+      [x["measurement"]["id"] for x in data["invalidated_measurements"]] == [m7_c], r.text)
+item = data["invalidated_measurements"][0]
+check("m7_c 失效链仅 C、根因 C（R 晚撤销不上溯）",
+      [x["certificate_id"] for x in item["failure_chain"]] == [C7]
+      and item["root_cause_certificate_id"] == C7, str(item))
+
+# G 自 03-15 撤销：m7_g(04-01) 失效
+r = client.post(f"/api/certificates/{G7}/revoke", json={
+    "expected_revision": 8, "revoked_at": "2026-03-15T00:00:00Z"})
+check("G 撤销成功", r.status_code == 200, r.text)
+data = r.json()
+check("G 撤销失效 m7_g",
+      [x["measurement"]["id"] for x in data["invalidated_measurements"]] == [m7_g], r.text)
+item = data["invalidated_measurements"][0]
+# 逐级追溯：G 自身撤销入环；C 虽撤销但晚于 G 校准 -> 停止；R 更不上溯
+check("m7_g 失效链仅 G、根因 G（C/R 均为上级晚撤销）",
+      [x["certificate_id"] for x in item["failure_chain"]] == [G7]
+      and item["root_cause_certificate_id"] == G7, str(item))
+
+# 详情接口与历史修订
+r = client.get(f"/api/measurements/{m7_g}?revision=7").json()
+check("历史 rev=7（G 撤销前）m7_g 有效无失效链",
+      r["measurement"]["valid"] is True
+      and r["failure_chain"] == [] and r["root_cause_certificate_id"] is None, str(r))
+r = client.get(f"/api/measurements/{m7_c}?revision=6").json()
+check("历史 rev=6（R 撤销、C 未撤销）m7_c 有效",
+      r["measurement"]["valid"] is True and r["failure_chain"] == [], str(r))
+for mid, root in ((m7_g, G7), (m7_c, C7), (m7_r, R7)):
+    r = client.get(f"/api/measurements/{mid}").json()
+    check(f"当前测量 {mid} 失效链仅自身、根因自身",
+          r["measurement"]["valid"] is False
+          and [x["certificate_id"] for x in r["failure_chain"]] == [root]
+          and r["root_cause_certificate_id"] == root, str(r))
 
 print()
 print(f"==== 结果：{PASS} 通过，{FAIL} 失败 ====")
