@@ -63,6 +63,34 @@ def serialize_cert(cert: dict[str, Any], revision: int) -> dict[str, Any]:
     }
 
 
+def causal_failure_chain(
+    chain: list[dict[str, Any]], revision: int
+) -> list[dict[str, Any]]:
+    """按每级子证书的校准时刻向上追溯失效因果链，返回 chain 的前缀。
+
+    从绑定证书开始逐级向上：
+    - 本级未失效（valid）：不属于失效链，终止；
+    - 本级已失效（revoked / invalid）：计入失效链；仅当本级校准时刻落入
+      上级失效区间时，上级失效才是本级失效的原因（递归判废），继续向上；
+      否则本级系自身撤销导致失效——上级晚撤销与本次失效无因果，不计入，
+      本级即根因，链到此为止。
+
+    返回列表的最后一个元素即根因证书。
+    """
+    links: list[dict[str, Any]] = []
+    for idx, cert in enumerate(chain):
+        if cert_status(cert, revision) not in ("revoked", "invalid"):
+            break
+        links.append(cert)
+        parent = chain[idx + 1] if idx + 1 < len(chain) else None
+        if parent is None:
+            break
+        fail_from, fail_to = cert_failure_window(parent, revision)
+        if fail_from is None or not (fail_from <= cert["calibrated_at"] < fail_to):
+            break
+    return links
+
+
 def load_cert_chain(conn, cert_id: int, revision: int) -> list[dict[str, Any]]:
     """沿 parent_id 向上取完整证书链（测量证书 -> ... -> 根证书）。"""
     chain: list[dict[str, Any]] = []

@@ -558,8 +558,11 @@ def revoke_certificate(cert_id: int, body: RevokeIn, conn=Depends(db.get_conn)):
             }
             for c in chain_rows
         ]
-        # 失效证书链：从绑定证书起，向上收集当前已失效（撤销/判废）的环节
-        failure_chain = [link for link in chain if link["status"] in ("revoked", "invalid")]
+        # 失效因果链：按每级子证书的校准时刻向上追溯（causal_failure_chain
+        # 返回 chain_rows 的前缀）。上级晚撤销、未覆盖本级校准时刻的环节不计入，
+        # 链尾即根因证书（自身撤销或递归判废的最近一级）。
+        causal = domain.causal_failure_chain(chain_rows, new_rev)
+        failure_chain = chain[: len(causal)]
         invalid_measurements.append(
             {
                 "measurement": serialize_measurement(

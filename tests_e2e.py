@@ -130,11 +130,12 @@ inv = data["invalidated_measurements"]
 check("仅 m3(07-15) 本次失效，数量=1", len(inv) == 1, str(len(inv)))
 check("失效的是 m3", bool(inv) and inv[0]["measurement"]["id"] == m3["id"])
 fc = inv[0]["failure_chain"]
-check("m3 失效链为 C->R", [x["certificate_id"] for x in fc] == [c_id, root_id],
+# R 在 C 校准时刻（02-01）之后才撤销（02-15），其失效区间未覆盖 C 的校准时刻，
+# 与 m3 的失效无因果：失效链仅含 C，根因为 C 自身撤销，R 不得误列入链
+check("m3 失效链仅含 C（R 晚撤销不计入）", [x["certificate_id"] for x in fc] == [c_id],
       str([x["certificate_id"] for x in fc]))
-check("根因证书为 R", inv[0]["root_cause_certificate_id"] == root_id)
-check("失效链状态 C=revoked,R=revoked",
-      [x["status"] for x in fc] == ["revoked", "revoked"])
+check("根因证书为 C（自身撤销）", inv[0]["root_cause_certificate_id"] == c_id)
+check("失效链状态 C=revoked", [x["status"] for x in fc] == ["revoked"])
 
 # G 校准 03-01 早于 C 失效起点 05-01 -> G 不判废；m1/m2 仍有效
 r = client.get(f"/api/measurements/{m1['id']}").json()
@@ -428,6 +429,76 @@ check("历史 rev=7 m_pre 仍有效", r["measurement"]["valid"] is True)
 for mid in (m_pre, m_post, m_g):
     r = client.get(f"/api/measurements/{mid}").json()
     check(f"当前 rev 测量 {mid} 无效", r["measurement"]["valid"] is False)
+
+print()
+print("== 场景 7：撤销因果追溯——上级晚撤销不列为根因 ==")
+reset_db()
+
+# R -> C -> G 三级链，每级校准时上级均有效
+r = mkcert(0, "STD7", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
+           "2027-01-01T00:00:00Z", 0.0, 0.5, root=True)
+R7 = r.json()["certificate"]["id"]
+r = mkcert(1, "A7", "2026-02-01T00:00:00Z", "2026-02-01T00:00:00Z",
+           "2026-12-01T00:00:00Z", 0.0, 0.5, parent=R7)
+C7 = r.json()["certificate"]["id"]
+r = mkcert(2, "B7", "2026-03-01T00:00:00Z", "2026-03-01T00:00:00Z",
+           "2026-11-01T00:00:00Z", 0.0, 0.5, parent=C7)
+G7 = r.json()["certificate"]["id"]
+
+r = post_meas(3, "2026-07-15T08:00:00Z", inst="A7")  # 绑定 C7，落在 C7 撤销后区间
+m_c = r.json()["measurement"]["id"]
+r = post_meas(4, "2026-10-15T08:00:00Z", inst="B7")  # 绑定 G7，落在 G7 撤销后区间
+m_g7 = r.json()["measurement"]["id"]
+rev_pre = rev()  # 5
+
+# 先在 C 校准时刻之后撤销 R（02-15 > 02-01）：C、G 均不判废，测量不失效
+r = client.post(f"/api/certificates/{R7}/revoke", json={
+    "expected_revision": 5, "revoked_at": "2026-02-15T00:00:00Z"})
+check("撤销 R7 成功", r.status_code == 200, r.text)
+data = r.json()
+check("R7 晚撤销无证书判废", data["invalidated_certificates"] == [])
+check("R7 晚撤销无测量失效", data["invalidated_measurement_count"] == 0)
+
+# 再撤销 C（05-01，晚于 G 校准 03-01）：m_c 因 C 自身撤销首次失效
+r = client.post(f"/api/certificates/{C7}/revoke", json={
+    "expected_revision": 6, "revoked_at": "2026-05-01T00:00:00Z"})
+check("撤销 C7 成功", r.status_code == 200, r.text)
+data = r.json()
+inv = data["invalidated_measurements"]
+check("仅 m_c 本次失效", [x["measurement"]["id"] for x in inv] == [m_c], str(inv))
+fc = inv[0]["failure_chain"]
+check("m_c 失效链仅含 C7（R7 晚撤销不计入）",
+      [x["certificate_id"] for x in fc] == [C7],
+      str([x["certificate_id"] for x in fc]))
+check("m_c 根因为 C7", inv[0]["root_cause_certificate_id"] == C7)
+check("G7 未判废（校准 03-01 早于 C7 失效起点）",
+      data["invalidated_certificates"] == [])
+
+# 最后撤销 G（09-01）：m_g7 因 G 自身撤销失效；链上 C、R 虽均已撤销，
+# 但失效区间均未覆盖 G 的校准时刻，根因仍为 G
+r = client.post(f"/api/certificates/{G7}/revoke", json={
+    "expected_revision": 7, "revoked_at": "2026-09-01T00:00:00Z"})
+check("撤销 G7 成功", r.status_code == 200, r.text)
+data = r.json()
+inv = data["invalidated_measurements"]
+check("仅 m_g7 本次失效", [x["measurement"]["id"] for x in inv] == [m_g7], str(inv))
+fc = inv[0]["failure_chain"]
+check("m_g7 失效链仅含 G7（C7/R7 晚撤销均不计入）",
+      [x["certificate_id"] for x in fc] == [G7],
+      str([x["certificate_id"] for x in fc]))
+check("m_g7 根因为 G7", inv[0]["root_cause_certificate_id"] == G7)
+
+# 历史修订查询不回归：rev=5（全部撤销前）两条测量均有效
+r = client.get(f"/api/measurements/{m_c}?revision={rev_pre}").json()
+check("历史 rev=5 m_c 有效", r["measurement"]["valid"] is True)
+r = client.get(f"/api/measurements/{m_g7}?revision={rev_pre}").json()
+check("历史 rev=5 m_g7 有效", r["measurement"]["valid"] is True)
+r = client.get(f"/api/measurements/{m_c}?revision=6").json()
+check("rev=6（R7 已撤销）m_c 仍有效", r["measurement"]["valid"] is True)
+r = client.get(f"/api/measurements/{m_c}").json()
+check("当前 m_c 无效", r["measurement"]["valid"] is False)
+r = client.get(f"/api/measurements/{m_g7}").json()
+check("当前 m_g7 无效", r["measurement"]["valid"] is False)
 
 print()
 print(f"==== 结果：{PASS} 通过，{FAIL} 失败 ====")
